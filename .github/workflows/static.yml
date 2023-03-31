@@ -2,11 +2,12 @@ name: Static analysis
 
 on:
   push:
-    branches: [ "master","staging/0805" ]
+    branches: [ "main","master","staging/0805" ]
   pull_request:
     branches:
       - "staging/**"
       - "master"
+      - "main"
 
 env:
   php-version: '8.0'
