@@ -1,0 +1,207 @@
+name: "Unit Tests"
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches:
+      - "staging/**"
+      - "master"
+
+  workflow_run:
+    workflows: ['Static analysis']
+    types: [completed]
+jobs:
+  #############
+  # Run tests
+  #############
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: [ '8.0' ]
+        postgres-version: [ '9.6' ]
+        testsuite: [ Api, Feature, Commands, Unit-Models, Unit-Services ]
+
+    name: "Zipto Unit Test"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    # postgres,redis install
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres-version }}
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_DB: zipto_testing
+          POSTGRES_PASSWORD: postgres
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v3
+
+      # PHP
+      - name: Setup PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: redis, pgsql, mbstring, fileinfo
+          coverage: xdebug
+      - name: Check PHP Version
+        run: php -v
+      - name: Check Composer Version
+        run: composer -V
+      - name: Check PHP Extensions
+        run: php -m
+
+      # Composer
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache composer dependencies
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          # Use composer.json for key, if composer.lock is not committed.
+          # key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install Composer dependencies
+        run: |
+          composer install --no-progress --no-interaction --prefer-dist --optimize-autoloader
+          composer require --dev --ignore-platform-reqs fzaninotto/faker:1.9.2
+
+      # Prepare Data
+      - name: Prepare the application
+        run: |
+          cp -f .env.example .env
+          mkdir -p results/coverage
+          touch results/coverage/test.xml
+      - name: Generate key
+        run: php artisan key:generate
+      - name: Run migrations
+        run: php artisan migrate --no-interaction -vvv
+        env:
+          DB_DATABASE: zipto_testing
+          DB_HOST: localhost
+          DB_PASSWORD: postgres
+          REDIS_HOST: localhost
+
+      # Test
+      - name: Set Branch parameter
+        id: branch
+        run : |
+          branch=$(echo "${{ github.ref }}" | sed -e 's,refs/heads/\(.*\),\1,')
+          echo "value=$branch" >> $GITHUB_OUTPUT
+      - name: Run Unit test suite
+        run: php artisan test -c phpunit.xml --testsuite ${{ matrix.testsuite }} --log-junit ./results/junit/results${{ matrix.testsuite }}.xml  --coverage-clover ./results/coverage/coverage${{ matrix.testsuite }}.xml
+        env:
+          DB_DATABASE: zipto_testing
+          DB_HOST: localhost
+          DB_PASSWORD: postgres
+          REDIS_HOST: localhost
+      - name: Fix results files
+        run: sed -i -e "s%$GITHUB_WORKSPACE/%%g" **/*.xml
+        working-directory: results
+      - name: Store results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: results
+          path: results
+
+  ###########################
+  # Reporting to sonarqube
+  ###########################
+  reporting:
+    needs: [tests]
+    runs-on: ubuntu-latest
+    name: SonarQube
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+
+      - name: Download results
+        uses: actions/download-artifact@v3
+        with:
+          path: results
+          name: results
+
+      # Yarn
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.node-version }}
+      - name: Get yarn cache directory path
+        id: yarn-cache
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
+      - name: Cache yarn files
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+            ${{ runner.os }}-yarn-
+
+      - name: Merge junit files
+        run: |
+          yarn global add junit-merge
+          $(yarn global bin)/junit-merge --recursive --dir results/junit --out results/results.xml
+
+      - name: Get sonar projectKey
+        id: get_sonar_project_key
+        uses: notiz-dev/github-action-json-property@release
+        with:
+          path: './.github/config/sonar.json'
+          prop_path: '${{ github.repository}}.project_key'
+
+      - name: Set sonar projectKey
+        id: set_sonar_project_key
+        run: |
+          sed -i "s/sonar\.projectKey=\(.*\)/sonar\.projectKey=${{ steps.get_sonar_project_key.outputs.prop }}/" sonar-project.properties
+          cat sonar-project.properties
+
+      - name: Set version parameter
+        id: version
+        run: |
+          version=$(git tag --points-at HEAD)
+          test -z "$version" && version="master"
+          echo "value=$version" >> $GITHUB_OUTPUT
+
+      - name: Set coverage list
+        id: coverage
+        run: |
+          SONAR_COVERAGE=$(ls -m --format=comma results/coverage/coverage*.xml | sed -e ':a;N;$!ba;s/\n//g; s/ //g;')
+          echo "list=$SONAR_COVERAGE" >> $GITHUB_OUTPUT
+
+      - name: Get sonar token
+        id: get_sonar_token
+        uses: notiz-dev/github-action-json-property@release
+        with:
+          path: './.github/config/sonar.json'
+          prop_path: '${{ github.repository}}.sonar_token'
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_HOST_URL: http://sonar.iannil.net/
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ steps.get_sonar_token.outputs.prop }}
+        with:
+          args: |
+            -Dsonar.projectVersion=${{ steps.version.outputs.value }}
+            -Dsonar.php.tests.reportPath=./results/results.xml
+            -Dsonar.php.coverage.reportPaths=${{ steps.coverage.outputs.list }}
