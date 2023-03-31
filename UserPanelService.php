@@ -583,7 +583,7 @@ class UserPanelService
                 "warehouse_id" => $warehouseId,
                 "amount" => $amount,
                 "order_id" => $orderId,
-                "tracking_number" => "" . $tracking,
+                "tracking_number" => "". $tracking,
                 "remark" => $remark,
                 "meta" => $meta,
                 "force_cost" => $forceCost
